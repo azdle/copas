@@ -261,13 +261,13 @@ function copas.receive(client, pattern, part)
   local current_log = _reading_log
   repeat
     s, err, part = client:receive(pattern, part)
-    if s or (not _isTimeout[err]) then
+    if s or (not _isTimeout[err]) or _usertimedoutsockets[client] then
+      if not s and _usertimedoutsockets[client] then err = "timeout" end
       _usertimedoutsockets[client] = nil
       _usertimeouts:remove(client)
       current_log[client] = nil
       return s, err, part
     end
-    if _usertimedoutsockets[client] then return nil, "timeout" end
     if err == "wantwrite" then
       current_log = _writing_log
       current_log[client] = gettime()
@@ -287,13 +287,13 @@ function copas.receivefrom(client, size)
   size = size or UDP_DATAGRAM_MAX
   repeat
     s, err, port = client:receivefrom(size) -- upon success err holds ip address
-    if s or err ~= "timeout" then
+    if s or err ~= "timeout" or _usertimedoutsockets[client] then
+      if not s and _usertimedoutsockets[client] then err = "timeout" end
       _usertimedoutsockets[client] = nil
       _usertimeouts:remove(client)
       _reading_log[client] = nil
       return s, err, port
     end
-    if _usertimedoutsockets[client] then return nil, "timeout" end
     _reading_log[client] = gettime()
     coroutine.yield(client, _reading)
   until false
@@ -307,13 +307,17 @@ function copas.receivePartial(client, pattern, part)
   local current_log = _reading_log
   repeat
     s, err, part = client:receive(pattern, part)
-    if s or ((type(pattern)=="number") and part~="" and part ~=nil ) or (not _isTimeout[err]) then
+    if s
+      or ((type(pattern)=="number") and part~="" and part ~=nil )
+      or (not _isTimeout[err])
+      or _usertimedoutsockets[client]
+    then
+      if not s and _usertimedoutsockets[client] then err = "timeout" end
       _usertimedoutsockets[client] = nil
       _usertimeouts:remove(client)
       current_log[client] = nil
       return s, err, part
     end
-    if _usertimedoutsockets[client] then return nil, "timeout" end
     if err == "wantwrite" then
       current_log = _writing_log
       current_log[client] = gettime()
@@ -346,13 +350,13 @@ function copas.send(client, data, from, to)
         coroutine.yield(client, _reading)
       end
     end
-    if s or (not _isTimeout[err]) then
+    if s or (not _isTimeout[err]) or _usertimedoutsockets[client] then
+      if not s and _usertimedoutsockets[client] then err = "timeout" end
       _usertimedoutsockets[client] = nil
       _usertimeouts:remove(client)
       current_log[client] = nil
       return s, err,lastIndex
     end
-    if _usertimedoutsockets[client] then return nil, "timeout" end
     if err == "wantread" then
       current_log = _reading_log
       current_log[client] = gettime()
@@ -375,17 +379,16 @@ function copas.sendto(client, data, ip, port)
     -- adds extra coroutine swap
     -- garantees that high throughput doesn't take other threads to starvation
     if (math.random(100) > 90) then
-      if _usertimedoutsockets[client] then return nil, "timeout" end
       _writing_log[client] = gettime()
       coroutine.yield(client, _writing)
     end
-    if s or err ~= "timeout" then
+    if s or err ~= "timeout" or _usertimedoutsockets[client] then
+      if not s and _usertimedoutsockets[client] then err = "timeout" end
       _usertimedoutsockets[client] = nil
       _usertimeouts:remove(client)
       _writing_log[client] = nil
       return s, err
     end
-    if _usertimedoutsockets[client] then return nil, "timeout" end
     _writing_log[client] = gettime()
     coroutine.yield(client, _writing)
   until false
@@ -400,7 +403,11 @@ function copas.connect(skt, host, port)
     -- non-blocking connect on Windows results in error "Operation already
     -- in progress" to indicate that it is completing the request async. So essentially
     -- it is the same as "timeout"
-    if ret or (err ~= "timeout" and err ~= "Operation already in progress") then
+    if ret
+      or (err ~= "timeout" and err ~= "Operation already in progress")
+      or _usertimedoutsockets[client]
+    then
+      if not ret and _usertimedoutsockets[client] then err = "timeout" end
       -- Once the async connect completes, Windows returns the error "already connected"
       -- to indicate it is done, so that error should be ignored. Except when it is the
       -- first call to connect, then it was already connected to something else and the
@@ -415,7 +422,6 @@ function copas.connect(skt, host, port)
       return ret, err
     end
     tried_more_than_once = tried_more_than_once or true
-    if _usertimedoutsockets[skt] then return nil, "timeout" end
     _writing_log[skt] = gettime()
     coroutine.yield(skt, _writing)
   until false
