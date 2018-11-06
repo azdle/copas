@@ -873,7 +873,7 @@ function copas.step(timeout)
 
   local nextusertimeout = _usertimeouts:getnext()
   if nextusertimeout then
-    timeout = math.min(timeout, nextusertimeout)
+    timeout = timeout and math.min(timeout, nextusertimeout) or nextusertimeout
   end
 
   local err = _select (timeout)
