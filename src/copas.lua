@@ -189,11 +189,15 @@ local _writing_log = {}
 
 local _reading = newset() -- sockets currently being read
 local _writing = newset() -- sockets currently being written
+local _timedout ={} -- sockets that have timed-out while being read or written
 local _isTimeout = {      -- set of errors indicating a timeout
   ["timeout"] = true,     -- default LuaSocket timeout
   ["wantread"] = true,    -- LuaSec specific timeout
   ["wantwrite"] = true,   -- LuaSec specific timeout
 }
+
+local _usertimeouts = {} -- user-facing socket relative (per operation) timeouts
+setmetatable(_usertimeouts, {__mode = "k"})
 
 -------------------------------------------------------------------------------
 -- Coroutine based socket I/O functions.
@@ -232,11 +236,23 @@ end
 -- receives data from a client over UDP. Not available for TCP.
 -- (this is a copy of receive() method, adapted for receivefrom() use)
 function copas.receivefrom(client, size)
-  local s, err, port
+  local s, err, port, timeout_hit
   size = size or UDP_DATAGRAM_MAX
+
+  if _usertimeouts[client] ~= 0 then
+    copas.settimeout(_usertimeouts[client], function(co)
+                                              timeout_hit = true
+                                              table.insert(_timedout, co)
+                                              _reading:remove(client)
+                                            end)
+  else
+    timeout_hit = true
+  end
+
   repeat
     s, err, port = client:receivefrom(size) -- upon success err holds ip address
-    if s or err ~= "timeout" then
+    if s or err ~= "timeout" or timeout_hit then
+      copas.canceltimeout()
       _reading_log[client] = nil
       return s, err, port
     end
@@ -414,7 +430,7 @@ local _skt_mt_tcp = {
                            end,
 
                    settimeout = function (self, time)
-                                  self.timeout=time
+                                  _usertimeouts[self.socket] = time
                                   return true
                                 end,
 
@@ -705,7 +721,14 @@ local _writable_t = {
 }
 
 addtaskWrite (_writable_t)
---
+
+-- timed-out threads task
+local _timedout_t = {
+    tick = function (self)
+        _doTick(table.remove(_timedout))
+    end
+}
+
 --sleeping threads task
 local _sleeping_t = {
     tick = function (self, time, ...)
@@ -842,6 +865,10 @@ end
 -------------------------------------------------------------------------------
 function copas.step(timeout)
   _sleeping_t:tick(gettime())
+  _timedout_t:tick()
+
+  -- don't let select block if there are timedout socket left to handle
+  if #_timedout > 0 then timeout = 0 end
 
   -- Need to wake up the select call in time for the next sleeping event
   local nextwait = _sleeping:getnext()
