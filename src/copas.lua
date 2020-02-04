@@ -12,6 +12,7 @@
 --
 -- $Id: copas.lua,v 1.37 2009/04/07 22:09:52 carregal Exp $
 -------------------------------------------------------------------------------
+local dbg = require("debugger")
 
 if package.loaded["socket.http"] and (_VERSION=="Lua 5.1") then     -- obsolete: only for Lua 5.1 compatibility
   error("you must require copas before require'ing socket.http")
@@ -212,16 +213,22 @@ end
 -- be provided as the 'pattern' below defaults to a string. Will throw a
 -- 'bad argument' error if omitted.
 function copas.receive(client, pattern, part)
-  local s, err
+  local s, err, timeout_hit
   pattern = pattern or "*l"
   local current_log = _reading_log
+  if _usertimeouts[client] ~= 0 then
+    copas.settimeout(_usertimeouts[client], function(co) error("fuck") end)
+  else
+    timeout_hit = true
+  end
   repeat
     s, err, part = client:receive(pattern, part)
-    if s or (not _isTimeout[err]) then
+    if s or (not _isTimeout[err]) or timeout_hit then
+      if not timeout_hit then copas.canceltimeout() end
       current_log[client] = nil
       return s, err, part
     end
-    if err == "wantwrite" then
+    if err == "wantwrite" then -- Can receive really get a want write?
       current_log = _writing_log
       current_log[client] = gettime()
       coroutine.yield(client, _writing)
@@ -232,6 +239,8 @@ function copas.receive(client, pattern, part)
     end
   until false
 end
+
+local function _reading_timeout(co)
 
 -- receives data from a client over UDP. Not available for TCP.
 -- (this is a copy of receive() method, adapted for receivefrom() use)
@@ -264,12 +273,23 @@ end
 -- same as above but with special treatment when reading chunks,
 -- unblocks on any data received.
 function copas.receivePartial(client, pattern, part)
-  local s, err
+  local s, err, timeout_hit
   pattern = pattern or "*l"
   local current_log = _reading_log
+  if _usertimeouts[client] ~= 0 then
+    local co = coroutine.running()
+    copas.settimeout(_usertimeouts[client], function() timeout_hit = true; current_log[client] = gettime() end)
+  else
+    timeout_hit = true
+  end
   repeat
     s, err, part = client:receive(pattern, part)
-    if s or ((type(pattern)=="number") and part~="" and part ~=nil ) or (not _isTimeout[err]) then
+    if s
+      or ((type(pattern)=="number") and part~="" and part ~=nil )
+      or (not _isTimeout[err])
+      or timeout_hit
+    then
+      if not timeout_hit then copas.canceltimeout() end
       current_log[client] = nil
       return s, err, part
     end
@@ -289,10 +309,15 @@ end
 -- yields to the writing set on timeouts
 -- Note: from and to parameters will be ignored by/for UDP sockets
 function copas.send(client, data, from, to)
-  local s, err
+  local s, err, timeout_hit
   from = from or 1
   local lastIndex = from - 1
   local current_log = _writing_log
+  if _usertimeouts[client] ~= 0 then
+    copas.settimeout(_usertimeouts[client], function() timeout_hit = true end)
+  else
+    timeout_hit = true
+  end
   repeat
     s, err, lastIndex = client:send(data, lastIndex + 1, to)
     -- adds extra coroutine swap
@@ -305,7 +330,8 @@ function copas.send(client, data, from, to)
         coroutine.yield(client, _reading)
       end
     end
-    if s or (not _isTimeout[err]) then
+    if s or (not _isTimeout[err]) or timeout_hit then
+      if not timeout_hit then copas.canceltimeout() end
       current_log[client] = nil
       return s, err,lastIndex
     end
@@ -324,8 +350,13 @@ end
 -- sends data to a client over UDP. Not available for TCP.
 -- (this is a copy of send() method, adapted for sendto() use)
 function copas.sendto(client, data, ip, port)
-  local s, err
-
+  local s, err, timeout_hit
+  if _usertimeouts[client] ~= 0 then
+    local co = coroutine.running()
+    copas.settimeout(_usertimeouts[client], function() timeout_hit = true; copas.wakeup(co) end)
+  else
+    timeout_hit = true
+  end
   repeat
     s, err = client:sendto(data, ip, port)
     -- adds extra coroutine swap
@@ -334,7 +365,8 @@ function copas.sendto(client, data, ip, port)
       _writing_log[client] = gettime()
       coroutine.yield(client, _writing)
     end
-    if s or err ~= "timeout" then
+    if s or err ~= "timeout" or timeout_hit then
+      if not timeout_hit then copas.canceltimeout() end
       _writing_log[client] = nil
       return s, err
     end
@@ -346,13 +378,18 @@ end
 -- waits until connection is completed
 function copas.connect(skt, host, port)
   skt:settimeout(0)
-  local ret, err, tried_more_than_once
+  local ret, err, tried_more_than_once, timeout_hit
+  if _usertimeouts[skt] ~= 0 then
+    copas.settimeout(_usertimeouts[skt], function() timeout_hit = true end)
+  else
+    timeout_hit = true
+  end
   repeat
     ret, err = skt:connect (host, port)
     -- non-blocking connect on Windows results in error "Operation already
     -- in progress" to indicate that it is completing the request async. So essentially
     -- it is the same as "timeout"
-    if ret or (err ~= "timeout" and err ~= "Operation already in progress") then
+    if ret or (err ~= "timeout" and err ~= "Operation already in progress") or timeout_hit then
       -- Once the async connect completes, Windows returns the error "already connected"
       -- to indicate it is done, so that error should be ignored. Except when it is the
       -- first call to connect, then it was already connected to something else and the
@@ -361,6 +398,7 @@ function copas.connect(skt, host, port)
         ret = 1
         err = nil
       end
+      if not timeout_hit then copas.canceltimeout() end
       _writing_log[skt] = nil
       return ret, err
     end
@@ -386,11 +424,17 @@ function copas.dohandshake(skt, sslt)
   ssl = ssl or require("ssl")
   local nskt, err = ssl.wrap(skt, sslt)
   if not nskt then return error(err) end
-  local queue
+  local queue, timeout_hit
   nskt:settimeout(0)
+  if _usertimeouts[skt] ~= 0 then
+    copas.settimeout(_usertimeouts[skt], function() timeout_hit = true end)
+  else
+    timeout_hit = true
+  end
   repeat
     local success, err = nskt:dohandshake()
     if success then
+      copas.canceltimeout()
       return nskt
     elseif err == "wantwrite" then
       queue = _writing
@@ -398,6 +442,9 @@ function copas.dohandshake(skt, sslt)
       queue = _reading
     else
       error(err)
+    end
+    if timeout_hit then
+      return nil, "timeout"
     end
     coroutine.yield(nskt, queue)
   until false
@@ -732,7 +779,7 @@ local _timedout_t = {
 --sleeping threads task
 local _sleeping_t = {
     tick = function (self, time, ...)
-       _doTick(_sleeping:pop(time), ...)
+       _doTick(_sleeping:pop(time, ...))
     end
 }
 
@@ -780,7 +827,7 @@ function copas.settimeout(delay, callback)
     to.timer:cancel()       -- already active, must cancel first
   end
 
-  if delay > 0 then
+  if (delay or 0) > 0 then
     to.co = co
     to.callback = callback
     to.timer = timer.new({
